@@ -617,3 +617,57 @@ Offered three options; user chose **"Keep LLM, throttle it."**
 
 - Appended Sessions 13 and 14; committed the non-blocking logging change
   (`python/main.py`) plus this log and pushed to `mpous/ventuno`.
+
+---
+
+## Session 15 — Log every inference + all-outcome confidences + LLM tokens/time
+
+**Date:** 2026-07-24
+
+### User prompt
+
+> show me all the inferences, even if it doesn't reach the 0,4 confidence. I
+> would like to see the confidences of the other possible outcomes of the
+> model. Show me the tokens and time spent for the LLM brick as well in the
+> logs.
+
+Followed by: log everything to PROMPTS.md, commit and push to the ventuno
+branch.
+
+### Thinking / diagnosis
+
+- Two separate thresholds were needed. The brick filters detections below its
+  own `confidence` BEFORE calling us, so to see weak/sub-play-threshold
+  outcomes we had to lower the brick's floor. Split into:
+  - `DETECT_FLOOR` (0.1) — the brick's threshold, kept low so it reports weak
+    detections we can log.
+  - `CONFIDENCE_THRESHOLD` (0.4) — the gameplay bar; only detections at/above
+    this are eligible to be locked as the human's move.
+- Caveat noted: it's an object-detection model, not a classifier, so it only
+  reports classes it actually detects above the floor — not a full softmax
+  over all three classes every frame.
+- The LLM brick's `chat()` returns only the final string with no usage info.
+  To count tokens and time generation we switched the commentator to
+  `chat_stream()` and count the yielded chunks (≈tokens) while timing with
+  `perf_counter`. The startup warmup call is timed too.
+
+### Changes made (`python/main.py`)
+
+- Split `DETECT_FLOOR` / `CONFIDENCE_THRESHOLD`; brick initialized with
+  `confidence=DETECT_FLOOR` and the init log reports both values.
+- Rewrote `handle_detections` to collect ALL rock/paper/scissors confidences
+  (`all_confs`), pick the best that qualifies (`>= CONFIDENCE_THRESHOLD`) for
+  gameplay, and log every inference:
+  `[INFER] #N  label=X%  label=Y%  lock=... (timing)` — where `lock=none
+  (all <40%)` when nothing reached the play bar, and `timing` distinguishes
+  back-to-back frames from idle gaps (`GAP_MS`) and the first frame.
+- Rewrote `commentator_worker` to stream and log
+  `[LLM] N tokens in X.Xs (Y.Y tok/s)` after each round's commentary, plus a
+  timed warmup line `[LLM] model ready (X.Xs)`.
+- Simplified `update_detection` (removed the old per-change `[DETECT]` line).
+
+### Outcome
+
+- Verified the edits are internally consistent (no stray references; all
+  symbols defined before use). Committed `python/main.py` plus this log and
+  pushed to `mpous/ventuno`.

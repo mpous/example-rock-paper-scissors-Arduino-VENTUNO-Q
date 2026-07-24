@@ -56,32 +56,38 @@ def _log_writer():
 
 threading.Thread(target=_log_writer, daemon=True).start()
 
-# One confidence knob drives BOTH the brick's internal threshold and our filter
-# so they never disagree. Override at runtime with the CONFIDENCE env var. The
-# brick ignores anything below this before it ever calls us, so lowering it is
-# the only way to see weaker detections in the logs.
+# Two thresholds, deliberately separate:
+#  - DETECT_FLOOR is the brick's own threshold. Kept LOW so the brick reports
+#    weak detections too (it filters anything below this BEFORE calling us), so
+#    we can log the confidence of every outcome the model emits, including ones
+#    below the play threshold. Note: this is an object-detection model, so it
+#    only reports objects it actually detects above the floor — not a full
+#    probability over all three classes every frame.
+#  - CONFIDENCE_THRESHOLD is the gameplay bar: only detections at/above it are
+#    eligible to be locked in as the human's move.
+DETECT_FLOOR = float(os.environ.get('DETECT_FLOOR', '0.1'))
 CONFIDENCE_THRESHOLD = float(os.environ.get('CONFIDENCE', '0.4'))
 
 # ─── Video Object Detection Brick ────────────────────────────────────────
 _detector = None
 try:
     from arduino.app_bricks.video_objectdetection import VideoObjectDetection
-    _detector = VideoObjectDetection(confidence=CONFIDENCE_THRESHOLD, debounce_sec=0.0)
-    log(f"[BRICK] VideoObjectDetection initialized (confidence={CONFIDENCE_THRESHOLD})")
+    _detector = VideoObjectDetection(confidence=DETECT_FLOOR, debounce_sec=0.0)
+    log(f"[BRICK] VideoObjectDetection initialized (floor={DETECT_FLOOR}, "
+        f"play threshold={CONFIDENCE_THRESHOLD})")
 except ImportError:
     log("[WARN] VideoObjectDetection brick not available — detection disabled")
 
 # ─── LLM Brick (live play-by-play commentator) ───────────────────────────
 _llm = None
 LLM_PERSONA = (
-    "You are an energetic live sports commentator narrating a Rock Paper "
-    "Scissors duel between a Human and an Arduino robot. Reply with ONE short, "
-    "punchy, exciting play-by-play line — like calling a football match. "
-    "No emojis. Do not explain the rules. Do not use quotation marks."
+    "You are a live sports commentator for a Rock Paper Scissors duel between a "
+    "Human and an Arduino robot. Reply with ONE short sentence of at most 12 "
+    "words. No emojis, no quotation marks, no explanations."
 )
 try:
     from arduino.app_bricks.llm import LargeLanguageModel
-    _llm = LargeLanguageModel(system_prompt=LLM_PERSONA, max_tokens=60, temperature=0.9)
+    _llm = LargeLanguageModel(system_prompt=LLM_PERSONA, max_tokens=24, temperature=0.9)
     log("[BRICK] LargeLanguageModel initialized")
 except ImportError:
     log("[WARN] LLM brick not available — commentary disabled")
@@ -107,6 +113,11 @@ RESULT_HOLD_SECS = 3
 # Per-frame detection logging floods stdout; the App Lab log pipe then applies
 # backpressure that can stall the detection callback thread. Off by default.
 DEBUG_DETECTIONS = os.environ.get('DEBUG_DETECTIONS') == '1'
+# The brick only calls us when it detects something, so a long pause between
+# callbacks usually means "nothing was in view" — not slow inference. Treat any
+# interval above this as an idle gap and keep it out of the cadence average, so
+# the reported rate reflects real inference speed rather than empty-frame gaps.
+GAP_MS = float(os.environ.get('GAP_MS', '1500'))
 
 WINS = {'Rock': 'Scissors', 'Scissors': 'Paper', 'Paper': 'Rock'}
 
@@ -134,16 +145,11 @@ class GameState:
         self.history = []
 
     def update_detection(self, label, confidence):
-        changed = False
         with self._lock:
             if self._detection_locked:
                 return
-            prev = self.detection
             self.detection = label
             self.confidence = confidence
-            changed = label != prev
-        if changed:
-            log(f"[DETECT] {label} ({confidence:.0%})")
 
     def play_round(self):
         arduino_move = random.choice(['Rock', 'Paper', 'Scissors'])
@@ -298,21 +304,41 @@ def _prompt_for(event):
 
 
 def commentator_worker():
+    # Warm the model once at startup. The first call triggers a multi-second
+    # model init that pegs the CPU and starves detection; paying it at boot
+    # keeps the first real round from stalling mid-game.
+    try:
+        log("[LLM] warming up model...")
+        t0 = time.perf_counter()
+        _llm.chat("Say ready.")
+        log(f"[LLM] model ready ({time.perf_counter() - t0:.1f}s)")
+    except Exception as e:
+        log(f"[LLM] warmup failed: {e}")
     while True:
         event = _milestones.get()
         prompt = _prompt_for(event)
         if not prompt:
             continue
         game.set_commentating(True)
+        # Stream so we can count tokens (chunks) and time the generation. The
+        # brick's chat() only returns the final string with no usage info.
+        t0 = time.perf_counter()
+        chunks = []
         try:
-            text = _llm.chat(prompt).strip()
+            for chunk in _llm.chat_stream(prompt):
+                chunks.append(chunk)
         except Exception as e:
             log(f"[LLM] commentary failed: {e}")
             game.set_commentating(False)
             continue
+        elapsed = time.perf_counter() - t0
         game.set_commentating(False)
+        text = "".join(chunks).strip()
+        n_tok = len(chunks)
+        tps = n_tok / elapsed if elapsed else 0.0
         if text:
             log(f"[LLM] {text}")
+            log(f"[LLM] {n_tok} tokens in {elapsed:.1f}s ({tps:.1f} tok/s)")
             game.add_commentary(text)
 
 
@@ -324,10 +350,9 @@ if _llm:
 # The brick fires on_detect_all only when it has at least one detection — empty
 # frames trigger no callback and the brick exposes no inference-time field. So
 # we time the interval between callbacks ourselves as an effective inference
-# cadence, and log a throttled heartbeat (once/sec) that proves inference is
-# live without re-creating the per-frame print firehose that stalled stdout.
+# cadence. We log every inference (all class confidences, including sub-play-
+# threshold) via the non-blocking log() so a wedged stdout can never stall us.
 _infer_last_ts = None
-_infer_last_log = 0.0
 _infer_count = 0
 _infer_intervals = []
 _infer_lock = threading.Lock()
@@ -347,9 +372,10 @@ def handle_detections(detections):
     if DEBUG_DETECTIONS:
         log(f"[BRICK-RAW] {detections}")
 
-    best_label, best_conf = None, None
+    # Collect the confidence of EVERY rock/paper/scissors detection in this
+    # frame, regardless of the play threshold, so we can log all outcomes.
+    all_confs = {}
     try:
-        valid = {}
         for k, v in detections.items():
             label = k.lower()
             if label not in VALID_LABELS:
@@ -360,39 +386,56 @@ def handle_detections(detections):
                 conf = v[0].get("confidence") if v and isinstance(v[0], dict) else None
             else:
                 conf = v
-            if conf is not None and conf >= CONFIDENCE_THRESHOLD:
-                valid[label] = conf
-        if valid:
-            best_label = max(valid, key=valid.get)
-            best_conf = valid[best_label]
-            game.update_detection(best_label, best_conf)
+            if conf is None:
+                continue
+            if label not in all_confs or conf > all_confs[label]:
+                all_confs[label] = conf
     except Exception as e:
         log(f"[BRICK] detection handler error: {e}")
+        return
 
-    global _infer_last_ts, _infer_last_log, _infer_count
+    # Only detections at/above the play threshold can be locked as the move.
+    best_label, best_conf = None, None
+    qualified = {l: c for l, c in all_confs.items() if c >= CONFIDENCE_THRESHOLD}
+    if qualified:
+        best_label = max(qualified, key=qualified.get)
+        best_conf = qualified[best_label]
+        game.update_detection(best_label, best_conf)
+
+    global _infer_last_ts, _infer_count
     now = time.perf_counter()
     with _infer_lock:
         _infer_count += 1
+        last = None
         if _infer_last_ts is not None:
-            _infer_intervals.append((now - _infer_last_ts) * 1000.0)
-            del _infer_intervals[100:]
+            last = (now - _infer_last_ts) * 1000.0
+            # Only frames delivered back-to-back count toward the cadence; a long
+            # pause is an idle gap (nothing detected), not a slow inference.
+            if last <= GAP_MS:
+                _infer_intervals.append(last)
+                del _infer_intervals[100:]
         _infer_last_ts = now
-        should_log = (now - _infer_last_log) >= 1.0
-        if should_log:
-            _infer_last_log = now
         count = _infer_count
-        intervals = list(_infer_intervals)
+        active = list(_infer_intervals)
 
-    if should_log:
-        det = f"{best_label} {best_conf:.0%}" if best_label else "no valid label"
-        if intervals:
-            last = intervals[-1]
-            avg = sum(intervals) / len(intervals)
-            rate = 1000.0 / avg if avg else 0.0
-            log(f"[INFER] result #{count}  {det}  interval={last:.0f}ms  "
-                  f"avg={avg:.0f}ms  ~{rate:.1f}/s")
-        else:
-            log(f"[INFER] result #{count}  {det} (first)")
+    if active:
+        avg = sum(active) / len(active)
+        rate = 1000.0 / avg if avg else 0.0
+    else:
+        avg = rate = 0.0
+
+    confs = "  ".join(f"{l}={all_confs[l]:.0%}"
+                      for l in sorted(all_confs, key=all_confs.get, reverse=True))
+    lock = (f"lock={best_label} {best_conf:.0%}" if best_label
+            else f"lock=none (all <{CONFIDENCE_THRESHOLD:.0%})")
+    if last is None:
+        timing = "first"
+    elif last > GAP_MS:
+        timing = f"gap={last:.0f}ms after idle, active ~{rate:.1f}/s"
+    else:
+        timing = f"interval={last:.0f}ms, active avg={avg:.0f}ms ~{rate:.1f}/s"
+
+    log(f"[INFER] #{count}  {confs}  {lock}  ({timing})")
 
 
 if _detector:
